@@ -1,6 +1,5 @@
 package org.secretdb.scheduled;
 
-import com.google.common.util.concurrent.Uninterruptibles;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -19,18 +18,15 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.List;
 
 public class BackupWorker implements Runnable{
-    private static final String BACKUP_LOG_PATH = System.getProperty("user.home") + "/secret_db/backup/last_modify_date";
-    private static final String SOURCE_DATA_DIR =  System.getProperty("user.home") + "/secret_db/data";
-    private static final String BACKUP_DIR =  System.getProperty("user.home") + "/secret_db/backup";
+    private static final String PRIMARY_BACKUP_PATH = System.getProperty("user.home") + "/secret_db";
+    private static final String SECONDARY_BACKUP_PATH = PRIMARY_BACKUP_PATH + "/external_backup";
+    private static final String SOURCE_DATA_DIR =  PRIMARY_BACKUP_PATH + "/data";
 
     private static final Logger logger = LogManager.getLogger(BackupWorker.class);
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
-
-    private final AtomicLong currentIteration = new AtomicLong(0L);
 
     /**
      * Runs this operation.
@@ -38,33 +34,42 @@ public class BackupWorker implements Runnable{
     @Override
     public void run() {
         try {
-            currentIteration.incrementAndGet();
+            for (String path: List.of(PRIMARY_BACKUP_PATH, SECONDARY_BACKUP_PATH)) {
+                logger.info("Backing up for path: {}", path);
 
-            final File backupLogFile = new File(BACKUP_LOG_PATH);
-
-            Files.createDirectories(Paths.get(backupLogFile.getParentFile().getParent()));
-
-            final LocalDate today = LocalDate.now();
-
-            if (!backupLogFile.exists()) {
-                logger.info("Back up journal doesn't exist, backing up and write journal now");
-                backupAndWriteToJournalFile(backupLogFile, today);
-            } else {
-                // Read the file and compare dates
-                final String dateOnFileString = readDateFromFile(backupLogFile);
-                final LocalDate dateOnFile = LocalDate.parse(dateOnFileString, DATE_TIME_FORMATTER);
-                if (today.equals(dateOnFile)) {
-                    logger.info("Skipping iteration as I've backed up today");
-                } else {
-                    backupAndWriteToJournalFile(backupLogFile, today);
+                /*
+                 * if the symlink doesn't exist, shouldn't backup secondary
+                 * note: when the actually inode doesn't exist, the symlink pointer would appear as non-exist
+                 */
+                if (SECONDARY_BACKUP_PATH.equals(path) && !new File(path).exists()) {
+                    logger.warn("Secondary backup path is not implemented yet, skipping");
+                    continue;
                 }
+
+                final String backupDir =  path + "/backup";
+                final String backupLogLocation = backupDir + "/last_modify_date";
+
+                final File backupLogFile = new File(backupLogLocation);
+
+                Files.createDirectories(Paths.get(backupLogFile.getParentFile().getParent()));
+
+                final LocalDate today = LocalDate.now();
+
+                if (backupLogFile.exists() && 
+                            today.equals(LocalDate.parse(readDateFromFile(backupLogFile), DATE_TIME_FORMATTER))) {
+                    logger.info("Skipping iteration as I've backed up at this location [{}] today", path);
+                    continue;
+                }
+
+                /*
+                 * Finally we are here: if the logic passes all previous conditions, it means we should backup now
+                 */
+                logger.info("Back up journal exists: [{}], backing up and write journal", backupLogFile.exists());
+                backupAndWriteToJournalFile(SOURCE_DATA_DIR, backupDir, backupLogFile, today);
             }
         } catch (final Throwable e) {
-            logger.fatal(
-                    "Back-up worker got terminated somehow at iteration {}. " +
-                            "Sleeping for 5s and will have to call the currently running JVM to exit. {}", currentIteration.get(), e);
-            Uninterruptibles.sleepUninterruptibly(5000, TimeUnit.MILLISECONDS);
-            System.exit(-1);
+            logger.warn(
+                    "Back-up worker got an exception somehow: {}", e);
         }
     }
 
@@ -84,18 +89,21 @@ public class BackupWorker implements Runnable{
         });
     }
 
-    // TODO: make it atomic?
-    private static void backupAndWriteToJournalFile(final File file, final LocalDate date) throws IOException {
+    private static void backupAndWriteToJournalFile(
+            final String sourceDir,
+            final String backupDir,
+            final File journalFile, 
+            final LocalDate date) throws IOException {
         final String currentDate = date.format(DATE_TIME_FORMATTER);
 
         try {
-            copyFilesInFolder(Paths.get(SOURCE_DATA_DIR), Paths.get(BACKUP_DIR + "/" + currentDate));
+            copyFilesInFolder(Paths.get(sourceDir), Paths.get(backupDir + "/" + currentDate));
             logger.info("Folder copied successfully!");
         } catch (IOException e) {
             logger.error("Failed to copy folder: " + e);
         }
 
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(file))) {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(journalFile))) {
             writer.write(currentDate);
             writer.newLine();
             logger.info("Wrote new date to journal file");
