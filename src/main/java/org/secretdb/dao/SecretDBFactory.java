@@ -28,9 +28,7 @@ public class SecretDBFactory {
 
         final String key = tenantId + mode;
 
-        // Atomic putIfAbsent
-        this.table.putIfAbsent(key, new OnDiskSecretDB(this.om));
-        return this.table.get(key);
+        return this.table.computeIfAbsent(key, ignored -> new OnDiskSecretDB(this.om));
     }
 
     public enum DB_MODE {
