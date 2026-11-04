@@ -17,6 +17,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
+import java.nio.file.*;
+import java.util.Objects;
 
 /**
  * An implementation of SecretDB interface with on-disk IO
@@ -25,19 +27,28 @@ public class OnDiskSecretDB implements SecretDB {
     private static final Logger logger = LogManager.getLogger(OnDiskSecretDB.class);
     private static final String HOME_DIRECTORY = System.getProperty("user.home");
     private final ObjectMapper om;
+    private final Path dataDirectory;
+    private static final Object FILE_LOCK = new Object();
 
     public OnDiskSecretDB(final ObjectMapper om) {
+        this(om, Path.of(HOME_DIRECTORY, "secret_db", "data"));
+    }
+
+    public OnDiskSecretDB(final ObjectMapper om, Path dataDirectory) {
         this.om = om;
+        this.dataDirectory = dataDirectory;
     }
 
     @Override
     public List<Secret> list(final String tenantId) {
-        final String filePath = HOME_DIRECTORY + "/secret_db/data/" + tenantId;
-        final File dbFile = new File(filePath);
+        synchronized (FILE_LOCK) {
+            final String filePath = dataDirectory.resolve(tenantId).toString();
+            final File dbFile = new File(filePath);
 
-        if (!dbFile.exists()) return Collections.emptyList();
+            if (!dbFile.exists()) return Collections.emptyList();
 
-        return executeAndLogLatency(arg -> listSecrets(arg), dbFile, "List");
+            return executeAndLogLatency(arg -> listSecrets(arg), dbFile, "List");
+        }
     }
 
     public void getFromSpecifiedFile() {
@@ -46,20 +57,24 @@ public class OnDiskSecretDB implements SecretDB {
 
     @Override
     public Optional<Secret> get(final String tenantId, final String name) {
-        final String filePath = HOME_DIRECTORY + "/secret_db/data/" + tenantId;
-        final File dbFile = new File(filePath);
+        synchronized (FILE_LOCK) {
+            final String filePath = dataDirectory.resolve(tenantId).toString();
+            final File dbFile = new File(filePath);
 
-        if (!dbFile.exists()) return Optional.empty();
+            if (!dbFile.exists()) return Optional.empty();
 
-        return executeAndLogLatency(arg -> getSecret(arg, name), dbFile, "Get");
+            return executeAndLogLatency(arg -> getSecret(arg, name), dbFile, "Get");
+        }
     }
 
     @Override
     public void write(final String tenantId, final Secret secret) {
-        final String filePath = HOME_DIRECTORY + "/secret_db/data/" + tenantId;
-        final File dbFile = getOrCreate(filePath);
+        synchronized (FILE_LOCK) {
+            final String filePath = dataDirectory.resolve(tenantId).toString();
+            final File dbFile = getOrCreate(filePath);
 
-        executeAndLogLatency(arg -> updateSecrets(arg, secret), dbFile, "Write");
+            executeAndLogLatency(arg -> updateSecrets(arg, secret), dbFile, "Write");
+        }
     }
 
     private <T,R> R executeAndLogLatency(Function<T, R> func, T input, final String operationName) {
@@ -104,8 +119,6 @@ public class OnDiskSecretDB implements SecretDB {
         }
     }
 
-    // TODO: place write lock when write to prevent dirty writes, read doesn't require lock
-    // This should be mitigated as we partition tenant db into separate files already, but in case rare concurrent modification, this is needed
     private Void updateSecrets(final File file, final Secret toUpdate) {
 
         final List<String> updatedLines = new ArrayList<>();
@@ -139,17 +152,47 @@ public class OnDiskSecretDB implements SecretDB {
             throw new RuntimeException("Exception when reading file", e);
         }
 
-        // Write updated lines back to the file
-        try (BufferedWriter writer = new BufferedWriter(new FileWriter(file.getAbsolutePath()))) {
-            for (String line : updatedLines) {
-                writer.write(line);
-                writer.newLine();
-            }
-        } catch (final IOException e) {
-            logger.error("Exception when writing file {}", e.toString());
-            throw new RuntimeException("Exception when writing file", e);
-        }
+        replaceFile(file.toPath(), updatedLines);
         return null;
+    }
+
+
+    @Override
+    public boolean delete(String tenantId, Secret expected) {
+        synchronized (FILE_LOCK) {
+            Path file = dataDirectory.resolve(tenantId);
+            if (!Files.exists(file)) return false;
+            try {
+                List<String> kept = new ArrayList<>();
+                boolean removed = false;
+                for (String line : Files.readAllLines(file)) {
+                    Secret current = om.readValue(line, Secret.class);
+                    if (Objects.equals(current.getName(), expected.getName())) {
+                        if (!Objects.equals(current.getValue(), expected.getValue())
+                                || !Objects.equals(current.getPrivate_key_hash(), expected.getPrivate_key_hash())) return false;
+                        removed = true;
+                    } else kept.add(line);
+                }
+                if (removed) replaceFile(file, kept);
+                return removed;
+            } catch (IOException e) { throw new IllegalStateException("Cannot delete secret", e); }
+        }
+    }
+
+    private static void replaceFile(Path file, List<String> lines) {
+        Path temporary = null;
+        try {
+            temporary = Files.createTempFile(file.toAbsolutePath().getParent(), "secret-write-", ".tmp");
+            Files.write(temporary, lines);
+            try { Files.move(temporary, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING); }
+            catch (AtomicMoveNotSupportedException e) { Files.move(temporary, file, StandardCopyOption.REPLACE_EXISTING); }
+        } catch (IOException e) { throw new IllegalStateException("Cannot replace secret file", e); }
+        finally {
+            if (temporary != null) {
+                try { Files.deleteIfExists(temporary); }
+                catch (IOException e) { logger.warn("Cannot remove temporary file", e); }
+            }
+        }
     }
 
     private File getOrCreate(final String filePath) {
@@ -180,3 +223,4 @@ public class OnDiskSecretDB implements SecretDB {
         }
     }
 }
+

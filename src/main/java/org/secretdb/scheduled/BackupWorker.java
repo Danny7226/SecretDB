@@ -2,6 +2,7 @@ package org.secretdb.scheduled;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.secretdb.dao.impl.SQLiteSecretDB;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -21,9 +22,21 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 public class BackupWorker implements Runnable{
-    private static final String PRIMARY_BACKUP_PATH = System.getProperty("user.home") + "/secret_db";
-    private static final String SECONDARY_BACKUP_PATH = PRIMARY_BACKUP_PATH + "/external_backup";
-    private static final String SOURCE_DATA_DIR =  PRIMARY_BACKUP_PATH + "/data";
+    private final String PRIMARY_BACKUP_PATH;
+    private final String SECONDARY_BACKUP_PATH;
+    private final String SOURCE_DATA_DIR;
+    private final Path sqlitePath;
+
+    public BackupWorker() {
+        this(Path.of(System.getProperty("user.home"), "secret_db"));
+    }
+
+    public BackupWorker(Path root) {
+        PRIMARY_BACKUP_PATH = root.toString();
+        SECONDARY_BACKUP_PATH = root.resolve("external_backup").toString();
+        SOURCE_DATA_DIR = root.resolve("data").toString();
+        sqlitePath = root.resolve("sqlite/secrets.db");
+    }
 
     private static final Logger logger = LogManager.getLogger(BackupWorker.class);
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
@@ -55,7 +68,9 @@ public class BackupWorker implements Runnable{
 
                 final LocalDate today = LocalDate.now();
 
-                if (backupLogFile.exists() && 
+                boolean sqliteSnapshotPresent = !Files.exists(sqlitePath)
+                        || Files.isRegularFile(Paths.get(backupDir, today.format(DATE_TIME_FORMATTER), "sqlite", "secrets.db"));
+                if (backupLogFile.exists() && sqliteSnapshotPresent &&
                             today.equals(LocalDate.parse(readDateFromFile(backupLogFile), DATE_TIME_FORMATTER))) {
                     logger.info("Skipping iteration as I've backed up at this location [{}] today", path);
                     continue;
@@ -81,6 +96,9 @@ public class BackupWorker implements Runnable{
         Files.walkFileTree(source, new SimpleFileVisitor<Path>() {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                // In-flight atomic replacements are not committed tenant files.
+                String name = file.getFileName().toString();
+                if (name.startsWith("secret-write-") && name.endsWith(".tmp")) return FileVisitResult.CONTINUE;
                 // Copy each file to the target
                 final Path targetFile = target.resolve(source.relativize(file));
                 Files.copy(file, targetFile, StandardCopyOption.REPLACE_EXISTING);
@@ -89,18 +107,22 @@ public class BackupWorker implements Runnable{
         });
     }
 
-    private static void backupAndWriteToJournalFile(
+    private void backupAndWriteToJournalFile(
             final String sourceDir,
             final String backupDir,
             final File journalFile, 
             final LocalDate date) throws IOException {
         final String currentDate = date.format(DATE_TIME_FORMATTER);
 
-        try {
-            copyFilesInFolder(Paths.get(sourceDir), Paths.get(backupDir + "/" + currentDate));
-            logger.info("Folder copied successfully!");
-        } catch (IOException e) {
-            logger.error("Failed to copy folder: " + e);
+        Path destination = Paths.get(backupDir, currentDate);
+        Files.createDirectories(destination);
+        if (Files.isDirectory(Paths.get(sourceDir))) {
+            copyFilesInFolder(Paths.get(sourceDir), destination);
+        }
+        if (Files.exists(sqlitePath)) {
+            SQLiteSecretDB.backup(sqlitePath, destination.resolve("sqlite/secrets.db"));
+        } else if ("sqlite".equals(System.getProperty("secretdb.storage", "file"))) {
+            throw new IOException("Configured SQLite database is missing; backup not marked successful");
         }
 
         try (BufferedWriter writer = new BufferedWriter(new FileWriter(journalFile))) {

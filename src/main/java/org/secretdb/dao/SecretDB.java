@@ -11,4 +11,8 @@ public interface SecretDB {
     Optional<Secret> get(final String tenantId, final String name);
 
     void write(final String tenantId, final Secret secret);
+
+    /** Delete only if the stored ciphertext and key hash still match the authenticated snapshot. */
+    boolean delete(final String tenantId, final Secret expected);
 }
+
