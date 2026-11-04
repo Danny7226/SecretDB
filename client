@@ -19,6 +19,16 @@ secret_db() {
       value=$3
       curl -i -X PUT http://localhost:8080/api/$SECRET_DB_TENANT -H "Content-Type: application/json" -d '{"key":"'$SECRET_DB_PRIVATE_KEY'", "name":"'$name'", "value":"'$value'"}'
     fi
+  elif [ "$1" = "d" ]; then
+    if [ -z "$2" ]; then
+      echo "Error: 'd' requires one additional argument (name)"
+      return 1
+    fi
+    # Serialize JSON rather than interpolating names/keys into JSON or curl arguments.
+    printf '%s\0%s' "$SECRET_DB_PRIVATE_KEY" "$2" |
+      python3 -c 'import sys,json; key,name=sys.stdin.buffer.read().decode().split("\0",1); print(json.dumps({"key":key,"name":name}))' |
+      curl --fail-with-body -sS -X DELETE "http://localhost:8080/api/$SECRET_DB_TENANT" \
+        -H "Content-Type: application/json" --data-binary @-
   else
     echo "Invalid argument: $1"
   fi

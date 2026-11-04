@@ -1,4 +1,6 @@
 # SecretDB
+[SQLite backend, migration, inspection and delete operation](SQLITE.md)
+
 A simple server that stores secrets on-disk with server-side encryption using tenant-specified private key;
 
 For security, either use it within your localhost, or always use **https** when running this server on a remote desktop

@@ -101,4 +101,39 @@ public class ReadWriteServlet extends HttpServlet {
             throw new RuntimeException("Exception deserializing payload", e); // TODO change to 4xx client exception
         }
     }
+
+    @Override
+    protected void doDelete(HttpServletRequest req, HttpServletResponse resp) throws IOException {
+        final String tenantId;
+        final Payload payload;
+        try {
+            tenantId = RequestUtil.getTenantId(req);
+            payload = om.readValue(req.getReader(), Payload.class);
+            if (payload == null || payload.getKey() == null || payload.getKey().isBlank()
+                    || payload.getName() == null || payload.getName().isBlank()) {
+                resp.sendError(400, "name and key are required");
+                return;
+            }
+        } catch (ValidationException | IOException | NullPointerException e) {
+            resp.sendError(400, "Invalid delete request");
+            return;
+        }
+        SecretDB db = secretDBFactory.getSecretDB(tenantId, SecretDBFactory.DB_MODE.WRITE);
+        Optional<Secret> found = db.get(tenantId, payload.getName());
+        if (found.isEmpty()) { resp.sendError(404, "Secret not found"); return; }
+        Secret expected = found.get();
+        if (expected.getPrivate_key_hash() == null) { resp.sendError(403, "Record has no key verifier"); return; }
+        // Use the existing verifier; never authorize deletion solely on CBC padding success.
+        byte[] supplied = SHA256.hash(payload.getKey()).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        byte[] stored = expected.getPrivate_key_hash().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        if (!java.security.MessageDigest.isEqual(supplied, stored)) {
+            resp.sendError(403, "Incorrect key");
+            return;
+        }
+        if (!db.delete(tenantId, expected)) {
+            resp.sendError(409, "Record changed or was deleted; retry with a fresh read");
+            return;
+        }
+        resp.setStatus(204);
+    }
 }
